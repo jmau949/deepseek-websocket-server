@@ -1,5 +1,6 @@
 import { FastifyInstance } from "fastify";
 import { Server as IOServer, Socket } from "socket.io";
+import axios from "axios";
 import { validateToken } from "../plugins/auth"; // Import JWT validation function
 
 /**
@@ -27,7 +28,6 @@ export default async function socketPlugin(fastify: FastifyInstance) {
     try {
       // Extract the token from the cookie header
       const cookieHeader = socket.handshake.headers.cookie;
-      console.log(cookieHeader);
       if (!cookieHeader) {
         fastify.log.warn(`Socket ${socket.id} missing authentication token.`);
         return next(new Error("Missing authentication token"));
@@ -66,21 +66,53 @@ export default async function socketPlugin(fastify: FastifyInstance) {
     fastify.log.info(`Socket connected: ${socket.id}, User: ${user.sub}`);
 
     // Listen for a custom event sent by the client.
-    socket.on("customEvent", (data) => {
+    socket.on("customEvent", async (data) => {
+      // Mark function as async
       fastify.log.info(
         `Received customEvent from ${user.sub} (${socket.id}): ${JSON.stringify(
           data
         )}`
       );
-      // Emit a response back to the same socket.
-      socket.emit("customResponse", {
-        message: "Hello from Fastify and Socket.io!",
-      });
-    });
 
-    // Handle socket disconnection.
-    socket.on("disconnect", () => {
-      fastify.log.info(`Socket disconnected: ${socket.id}, User: ${user.sub}`);
+      try {
+        // Make a streaming request to DeepSeek
+        const response = await axios.post(
+          "http://localhost:11434/api/generate",
+          {
+            model: "deepseek-r1",
+            prompt: data,
+          },
+          { responseType: "stream" } // Enable streaming response
+        );
+
+        // Process the stream line by line
+        response.data.on("data", (chunk: Buffer) => {
+          const lines = chunk
+            .toString()
+            .split("\n")
+            .filter((line) => line.trim());
+
+          for (const line of lines) {
+            try {
+              const parsed = JSON.parse(line);
+              if (parsed.response) {
+                socket.emit("customResponse", { message: parsed.response });
+              }
+            } catch (err) {
+              fastify.log.error(`Error parsing stream chunk: ${err.message}`);
+            }
+          }
+        });
+
+        response.data.on("end", () => {
+          socket.emit("customResponse", { message: "[DONE]" });
+        });
+      } catch (error) {
+        fastify.log.error(`DeepSeek API request failed: ${error.message}`);
+        socket.emit("customResponse", {
+          message: "Error fetching response from DeepSeek",
+        });
+      }
     });
   });
 }
