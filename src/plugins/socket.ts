@@ -77,7 +77,7 @@ export default async function socketPlugin(fastify: FastifyInstance) {
       try {
         // Make a streaming request to DeepSeek
         const response = await axios.post(
-          "http://localhost:11434/api/generate",
+          "http://localhost:11435/api/generate",
           {
             model: "deepseek-r1",
             prompt: data,

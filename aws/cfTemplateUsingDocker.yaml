@@ -1,0 +1,167 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Deploy EC2 instance and run DeepSeek-R1 LLM using a custom Dockerfile'
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair
+
+  InstanceType:
+    Description: EC2 instance type with GPU
+    Type: String
+    Default: g4dn.xlarge
+    AllowedValues:
+      - g4dn.xlarge
+      - g4dn.2xlarge
+      - g5.xlarge
+      - g5.2xlarge
+      - p3.2xlarge
+    ConstraintDescription: Must be a valid GPU EC2 instance type
+
+  YourIP:
+    Description: Your IP address for SSH access (x.x.x.x/32)
+    Type: String
+    Default: 0.0.0.0/0
+
+Resources:
+  OllamaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH and Ollama API access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref YourIP
+        - IpProtocol: tcp
+          FromPort: 11435
+          ToPort: 11435
+          CidrIp: 0.0.0.0/0
+
+  OllamaInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      SecurityGroups:
+        - !Ref OllamaSecurityGroup
+      KeyName: !Ref KeyName
+      ImageId: ami-0c7217cdde317cfec  # Ubuntu 22.04 LTS for us-east-1, update for other regions
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash -xe
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          
+          # Update system
+          apt-get update
+          apt-get upgrade -y
+          
+          # Install Docker
+          apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+          add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+          apt-get update
+          apt-get install -y docker-ce docker-ce-cli containerd.io
+          systemctl enable docker
+          systemctl start docker
+          
+          # Install NVIDIA drivers
+          apt-get install -y linux-headers-$(uname -r)
+          apt-get install -y nvidia-driver-535 nvidia-utils-535
+          
+          # Install NVIDIA Container Toolkit
+          distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+          curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | apt-key add -
+          curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | tee /etc/apt/sources.list.d/nvidia-docker.list
+          apt-get update
+          apt-get install -y nvidia-container-toolkit
+          systemctl restart docker
+          
+          # Create project directory
+          mkdir -p /opt/ollama-deepseek
+          cd /opt/ollama-deepseek
+          
+          # Create Dockerfile
+          cat > Dockerfile << 'EOF'
+          FROM ollama/ollama:latest
+
+          # Set environment variables
+          ENV OLLAMA_HOST=0.0.0.0
+          ENV OLLAMA_MODELS=/root/.ollama/models
+
+          # Expose port 11435
+          EXPOSE 11435
+
+          # Create a working directory
+          WORKDIR /app
+
+          # Install necessary dependencies
+          RUN apt-get update && \
+              apt-get install -y --no-install-recommends \
+              curl \
+              ca-certificates \
+              && rm -rf /var/lib/apt/lists/*
+
+          # Create a startup script to download the model and start the server
+          RUN echo '#!/bin/bash \n\
+          ollama serve & \n\
+          sleep 5 \n\
+          echo "Pulling deepseek-r1 model..." \n\
+          ollama pull deepseek-r1 \n\
+          echo "Model pulled successfully. Server is running on port 11435." \n\
+          # Keep container running \n\
+          tail -f /dev/null' > /app/start.sh && \
+              chmod +x /app/start.sh
+
+          # Set the start script as the entrypoint
+          ENTRYPOINT ["/app/start.sh"]
+          EOF
+          
+          # Build Docker image
+          docker build -t ollama-deepseek .
+          
+          # Create systemd service
+          cat > /etc/systemd/system/ollama-deepseek.service << 'EOF'
+          [Unit]
+          Description=Ollama DeepSeek Service
+          After=docker.service
+          Requires=docker.service
+          
+          [Service]
+          Restart=always
+          ExecStartPre=-/usr/bin/docker rm -f ollama-deepseek
+          ExecStart=/usr/bin/docker run --name ollama-deepseek --gpus all -p 11435:11435 -v ollama-data:/root/.ollama ollama-deepseek
+          ExecStop=/usr/bin/docker stop ollama-deepseek
+          
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          
+          # Enable and start service
+          systemctl enable ollama-deepseek.service
+          systemctl start ollama-deepseek.service
+          
+          echo "Setup complete!"
+
+      Tags:
+        - Key: Name
+          Value: Ollama-DeepSeek-R1-Instance
+
+Outputs:
+  InstanceId:
+    Description: ID of the created EC2 instance
+    Value: !Ref OllamaInstance
+  
+  PublicDNS:
+    Description: Public DNS of the created EC2 instance
+    Value: !GetAtt OllamaInstance.PublicDnsName
+  
+  OllamaEndpoint:
+    Description: Endpoint for Ollama API
+    Value: !Join ["", ["http://", !GetAtt OllamaInstance.PublicDnsName, ":11435"]]
